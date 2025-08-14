@@ -8,15 +8,16 @@ def create_report_agent(llm: OpenAI, tools: list | None = None) -> Agent:
     return Agent(
         role="Financial Report Writer",
         goal=(
-            "Summarize all findings into a concise and informative report about the company´s financial performance."
-            "Compose a clear, concise company report including an executive summary, "
-            "a section focused on the latest financial results, and a separate section "
-            "highlighting key trends and comparisons with past years. Make sure to Include key facts and figures."
+            "Create a concise but complete business report by following the structure exactly. "
+            "Write each section concisely but completely before moving to the next. "
+            "Focus on essential information without unnecessary detail. Always include the end marker. "
+            "For financial sections, use simple formatting and avoid complex symbols or formatting."
         ),
         backstory=(
-            "You are a professional business skilled in summarizing complex financial data "
-            "into accessible insights for business stakeholders, packaged into easy-to-understand business reports. "
-            "You are fact based and great at summarizing and presenting financial data and business insights in a clear and concise manner."
+            "You are a skilled business analyst who writes concise, complete reports. "
+            "You focus on essential information without unnecessary detail. "
+            "You always complete what you start and include required markers. "
+            "You use simple, clean formatting and avoid complex symbols or formatting that could cause issues."
         ),
         verbose=True,
         allow_delegation=False,
