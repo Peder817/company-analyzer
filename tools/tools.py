@@ -56,59 +56,145 @@ import yfinance as yf
 
 def create_financial_data_tool():
     """Tool for fetching recent financial data by company name using Yahoo Finance."""
+    import yfinance as yf
+    import pandas as pd
+    import requests
+
+    # --- små helpers för normalisering ---
+    METRIC_MAP = {
+        "total revenue": "revenue",
+        "revenue": "revenue",
+        "net sales": "revenue",
+        "sales": "revenue",
+        "turnover": "revenue",
+        "net income": "net_income",
+        "net profit": "net_income",
+        "profit": "net_income",
+        "ebitda": "ebitda",
+        "adjusted ebitda": "ebitda",
+    }
+
+    def _q_label(x) -> str:
+        if isinstance(x, pd.Timestamp):
+            p = pd.Period(x, freq="Q")
+            return f"Q{p.quarter} {p.year}"
+        try:
+            p = pd.Period(pd.to_datetime(str(x)), freq="Q")
+            return f"Q{p.quarter} {p.year}"
+        except Exception:
+            return str(x)
+
+    def _norm_metric(name: str) -> str | None:
+        return METRIC_MAP.get(str(name).strip().lower())
+
+    def _to_int(v):
+        try:
+            if pd.isna(v):
+                return None
+            return int(float(v))
+        except Exception:
+            return None
+
+    def _normalize_quarterly_financials(df: pd.DataFrame) -> tuple[dict, list]:
+        """Returnerar (series_dict, rows_list) där rows_list är för UI:t."""
+        if df is None or df.empty:
+            return {}, []
+        cols = list(df.columns)
+        labels = [_q_label(c) for c in cols]
+
+        # 1) Series per metrik (behåll originalnamn så agenten kan citera)
+        wanted = ["Total Revenue", "Revenue", "Net Income", "EBITDA", "Operating Income", "Gross Profit"]
+        series_dict: dict[str, dict] = {}
+        for metric in wanted:
+            if metric in df.index:
+                s = df.loc[metric]
+                series = {}
+                for lbl, col in zip(labels, cols):
+                    val = _to_int(s.get(col))
+                    if val is not None:
+                        series[lbl] = val
+                if series:
+                    series_dict[metric] = series
+
+        # 2) Radrformat (quarters) för diagrammet
+        rows = []
+        for lbl, col in zip(labels, cols):
+            row = {"quarter": lbl}
+            for idx in df.index:
+                std = _norm_metric(idx)
+                if not std:
+                    continue
+                val = _to_int(df.loc[idx, col])
+                if val is not None:
+                    row[std] = val
+            if any(k in row for k in ("revenue", "net_income", "ebitda")):
+                rows.append(row)
+
+        # sortera äldst→nyast
+        def _q_sort_key(qs: str):
+            try:
+                p = pd.Period(qs.replace("-", " "), freq="Q")
+                return (p.year, p.quarter)
+            except Exception:
+                return (0, 0)
+        rows = sorted(rows, key=lambda r: _q_sort_key(r["quarter"]))
+        return series_dict, rows
 
     def get_financial_data(company_name: str) -> dict:
         try:
-            # 1. Försök hitta rätt ticker
-            search = yf.Ticker(company_name)  # If company_name is already a ticker
-            ticker = company_name.upper()
+            # 1) hitta/gissa ticker
+            ticker_symbol = company_name.upper()
+            t = yf.Ticker(company_name)
+            if not getattr(t, "info", None) or t.info.get("regularMarketPrice") is None:
+                url = f"https://query1.finance.yahoo.com/v1/finance/search?q={company_name}"
+                resp = requests.get(url, timeout=5)
+                data = resp.json()
+                if data.get("quotes"):
+                    ticker_symbol = data["quotes"][0]["symbol"]
+                    t = yf.Ticker(ticker_symbol)
+                else:
+                    return {"error": f"No ticker found for company: {company_name}"}
 
-            # Om info saknas helt, prova via yfinance search
-            if not search.info or search.info.get("regularMarketPrice") is None:
-                try:
-                    import requests
-                    url = f"https://query1.finance.yahoo.com/v1/finance/search?q={company_name}"
-                    resp = requests.get(url, timeout=5)
-                    data = resp.json()
-                    if data.get("quotes"):
-                        ticker = data["quotes"][0]["symbol"]
-                        search = yf.Ticker(ticker)
-                    else:
-                        return {"error": f"No ticker found for company: {company_name}"}
-                except Exception as e:
-                    return {"error": f"Failed to find ticker for {company_name}: {e}"}
+            # 2) hämta data
+            qf_df = t.quarterly_financials  # index=metrics, columns=Timestamps (kan vara tom)
+            series_dict, rows = _normalize_quarterly_financials(qf_df)
 
-            # 2. Hämta senaste års- och kvartalsdata (max 2 år)
-            price_history = search.history(period="2y").to_dict()
+            # prisdata → str-nycklar (slipper Streamlit-varning)
+            hist = t.history(period="2y")
+            price_history = {k: {str(idx): v for idx, v in hist[k].dropna().items()} for k in hist.columns} if not hist.empty else {}
 
+            # 3) bygg resultat — behåll dina gamla fält orörda
             data = {
-                "ticker": ticker,
+                "ticker": ticker_symbol,
                 "company_info": {
-                    "shortName": search.info.get("shortName"),
-                    "longName": search.info.get("longName"),
-                    "sector": search.info.get("sector"),
-                    "industry": search.info.get("industry"),
-                    "country": search.info.get("country"),
-                    "website": search.info.get("website"),
-                    "marketCap": search.info.get("marketCap"),
-                    "regularMarketPrice": search.info.get("regularMarketPrice"),
+                    "shortName": t.info.get("shortName"),
+                    "longName": t.info.get("longName"),
+                    "sector": t.info.get("sector"),
+                    "industry": t.info.get("industry"),
+                    "country": t.info.get("country"),
+                    "website": t.info.get("website"),
+                    "marketCap": t.info.get("marketCap"),
+                    "regularMarketPrice": t.info.get("regularMarketPrice"),
                 },
-                "quarterly_financials": search.quarterly_financials.to_dict(),
-                "financials": search.financials.to_dict(),
-                "quarterly_balance_sheet": search.quarterly_balance_sheet.to_dict(),
-                "balance_sheet": search.balance_sheet.to_dict(),
-                "quarterly_cashflow": search.quarterly_cashflow.to_dict(),
-                "cashflow": search.cashflow.to_dict(),
-                "price_history_2y": price_history
+                # originalfälten (kan innehålla Timestamps i nycklar – vi låter dem vara för bakåtkompat)
+                "quarterly_financials": (qf_df.to_dict() if qf_df is not None and not qf_df.empty else {}),
+                "financials": (t.financials.to_dict() if t.financials is not None and not t.financials.empty else {}),
+                "quarterly_balance_sheet": (t.quarterly_balance_sheet.to_dict() if t.quarterly_balance_sheet is not None and not t.quarterly_balance_sheet.empty else {}),
+                "balance_sheet": (t.balance_sheet.to_dict() if t.balance_sheet is not None and not t.balance_sheet.empty else {}),
+                "quarterly_cashflow": (t.quarterly_cashflow.to_dict() if t.quarterly_cashflow is not None and not t.quarterly_cashflow.empty else {}),
+                "cashflow": (t.cashflow.to_dict() if t.cashflow is not None and not t.cashflow.empty else {}),
+                "price_history_2y": price_history,
+                # nya fält för UI/agent
+                "quarters": rows,                         # ← det här behöver din chart
+                "quarterly_financials_norm": series_dict, # ← valfritt för analys-agenten
             }
             return data
-
         except Exception as e:
             return {"error": f"Failed to fetch financial data: {e}"}
 
-    # Return in dictionary format as expected by CrewAI
+    # CrewAI förväntar sig dict/BaseTool. Vi returnerar dict (som innan).
     return {
         "name": "financial_data",
-        "description": "Fetch recent financial data (last 2 years) for a given company name using Yahoo Finance.",
-        "function": get_financial_data
+        "description": "Fetch structured quarterly financials and price history.",
+        "function": get_financial_data,
     }

@@ -7,6 +7,7 @@ import datetime
 import warnings
 import io
 import contextlib
+import json
 
 warnings.filterwarnings("ignore")
 
@@ -274,6 +275,145 @@ def resolve_ticker(company: str) -> list[str]:
         return aliases["ericsson"]
     return aliases.get(c, [])
 
+_QUART_RE = re.compile(r"\bQ([1-4])\s*([12]\d{3})\b|\b([12]\d{3})\s*Q([1-4])\b", re.I)
+
+def _label_from_ts(x) -> str:
+    """Timestamp/str -> 'Q# YYYY'."""
+    if isinstance(x, pd.Timestamp):
+        p = pd.Period(x, freq="Q")
+        return f"Q{p.quarter} {p.year}"
+    s = str(x)
+    m = _QUART_RE.search(s)
+    if m:
+        if m.group(1) and m.group(2):
+            return f"Q{int(m.group(1))} {int(m.group(2))}"
+        if m.group(3) and m.group(4):
+            return f"Q{int(m.group(4))} {int(m.group(3))}"
+    # fall back: försök tolka datum → period
+    try:
+        ts = pd.to_datetime(s)
+        return _label_from_ts(ts)
+    except Exception:
+        return s  # lämna oförändrad om inte tolkningsbart
+
+def _parse_quarterly_json_block(*texts: str) -> dict | None:
+    """Plocka JSON mellan markörerna om det finns."""
+    for t in texts:
+        if not t:
+            continue
+        m = re.search(
+            r"===\s*QUARTERLY DATA\s*\(returned\)\s*===\s*(\{.*?\})\s*===\s*END\s*===",
+            t,
+            flags=re.S | re.I,
+        )
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                pass
+    return None
+
+def _normalize_quarterly_from_tool(obj) -> dict:
+    """
+    Normalisera vad 'financial_data_tool' råkar returnera till:
+    {
+      'quarterly_financials': { 'Total Revenue': {'Q2 2025': 82000000000, ...}, ... }
+    }
+    Tillåt: DataFrame, dict med Timestamp-nycklar, etc.
+    """
+    out = {"quarterly_financials": {}}
+    if obj is None:
+        return out
+    # yfinance-liknande: df i obj.get('quarterly_financials') eller direkt df
+    qf = obj.get("quarterly_financials") if isinstance(obj, dict) else obj
+    if qf is None or (hasattr(qf, "empty") and getattr(qf, "empty")):
+        return out
+
+    if isinstance(qf, pd.DataFrame):
+        # index=metrics, columns=Timestamps
+        metrics = ["Total Revenue", "Net Income", "EBITDA", "Operating Income", "Gross Profit"]
+        cols = list(qf.columns)
+        labels = [_label_from_ts(c) for c in cols]
+        for m in metrics:
+            if m in qf.index:
+                series = qf.loc[m].to_dict()
+                out["quarterly_financials"][m] = {
+                    lbl: int(series[dt]) for lbl, dt in zip(labels, cols)
+                    if pd.notna(series[dt])
+                }
+        return out
+
+    if isinstance(qf, dict):
+        # Kan vara {metric: {quarter_label|Timestamp: value}} eller {quarter: {metric: value}}
+        # Gör om alla quarter-nycklar till 'Q# YYYY'
+        # 1) Om nycklar ser ut som metrics
+        maybe_metric_keys = list(qf.keys())[:5]
+        if any(k for k in maybe_metric_keys if isinstance(k, str) and any(w in k.lower() for w in ["revenue","income","ebit"])):
+            norm = {}
+            for metric, series in qf.items():
+                if isinstance(series, dict):
+                    norm[metric] = { _label_from_ts(k): int(v) for k, v in series.items() if v is not None }
+            out["quarterly_financials"] = norm
+            return out
+        # 2) Annars: {quarter: {metric: value}}
+        acc = {}
+        for qlabel, md in qf.items():
+            lbl = _label_from_ts(qlabel)
+            if isinstance(md, dict):
+                for metric, val in md.items():
+                    if val is None: 
+                        continue
+                    acc.setdefault(metric, {})[lbl] = int(val)
+        out["quarterly_financials"] = acc
+        return out
+
+    # okänt format → returnera tom struktur
+    return out
+
+def _merge_quarterly_payloads(tool_norm: dict, block_obj: dict | None) -> dict:
+    """
+    Slår ihop:
+      - tool_norm: {'quarterly_financials': {...}}
+      - block_obj: kan innehålla 'quarterly_financials' och/eller 'quarters' list[dict]
+    Returnerar en payload som UI:t gillar.
+    """
+    result = {"quarterly_financials": {}, "quarters": []}
+
+    # 1) från tool
+    if tool_norm and tool_norm.get("quarterly_financials"):
+        result["quarterly_financials"] = tool_norm["quarterly_financials"]
+
+    # 2) från block
+    if block_obj:
+        # a) quarters-lista (redan radformat)
+        if isinstance(block_obj.get("quarters"), list):
+            result["quarters"] = block_obj["quarters"]
+        # b) quarterly_financials från blocket → merge
+        if isinstance(block_obj.get("quarterly_financials"), dict):
+            for metric, series in block_obj["quarterly_financials"].items():
+                result["quarterly_financials"].setdefault(metric, {}).update(series)
+
+        # c) källor (om du vill föra upp dem)
+        # (lämnas till din befintliga sources-logic)
+    return result
+
+def _extract_quarterly_json_block(*texts: str) -> dict | None:
+    """Hittar JSON mellan '=== QUARTERLY DATA (returned) ===' och '=== END ==='."""
+    pat = re.compile(
+        r"===\s*QUARTERLY DATA\s*\(returned\)\s*===\s*(\{.*?\})\s*===\s*END\s*===",
+        re.S | re.I,
+    )
+    for t in texts:
+        if not t:
+            continue
+        m = pat.search(t)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                pass
+    return None
+
 # ---------------------------
 # Main pipeline
 # ---------------------------
@@ -432,23 +572,54 @@ def run_company_analysis(company_name: str):
         log_debug("FINAL REPORT (raw)", final_report_raw)
         log_debug("FINAL REPORT (cleaned)", final_report)
 
-        # Quarterly data – utan last_n_quarters (för kompatibilitet med fler varianter av tool)
-        try:
-            if hasattr(financial_data_tool, "run"):
-                quarterly_data = financial_data_tool.run(company_name)
-            elif callable(financial_data_tool):
-                quarterly_data = financial_data_tool(company_name)
-            elif isinstance(financial_data_tool, dict) and callable(financial_data_tool.get("function")):
-                quarterly_data = financial_data_tool["function"](company_name)
-            else:
-                raise TypeError("Unsupported financial_data_tool type")
-        except Exception as e:
-            log_debug("QUARTERLY DATA ERROR", str(e))
-            quarterly_data = None
+        # === Quarterly data: först försök hämta från analysens JSON‑block ===
+        block_obj = _extract_quarterly_json_block(
+            finres_text,
+            finanal_text,
+            final_report  # om du senare väljer att inkludera blocket i rapporten
+        )
 
-        log_debug("FINAL REPORT (returned)", final_report)
-        log_debug("SOURCES (returned)", sources)
-        log_debug("QUARTERLY DATA (returned)", "OK" if quarterly_data is not None else "No data")
+        quarterly_data = None
+
+        if block_obj:
+            quarterly_data = {
+                # standardnycklar som app.py/quarterly_df förväntar sig
+                "quarterly_financials": block_obj.get("quarterly_financials", {}),
+                "quarters": block_obj.get("quarters", []),
+            }
+            log_debug("QUARTERLY DATA (from JSON block)", {
+                "series_keys": list(quarterly_data["quarterly_financials"].keys()),
+                "rows": len(quarterly_data["quarters"]),
+            })
+        else:
+            # fallback: kör verktyget precis som tidigare
+            try:
+                if hasattr(financial_data_tool, "run"):
+                    tool_raw = financial_data_tool.run(company_name)
+                elif callable(financial_data_tool):
+                    tool_raw = financial_data_tool(company_name)
+                elif isinstance(financial_data_tool, dict) and callable(financial_data_tool.get("function")):
+                    tool_raw = financial_data_tool["function"](company_name)
+                else:
+                    raise TypeError("Unsupported financial_data_tool type")
+
+                # mappa till standardnycklar om möjligt
+                if isinstance(tool_raw, dict):
+                    quarterly_data = {
+                        "quarterly_financials": tool_raw.get("quarterly_financials_norm")
+                                              or tool_raw.get("quarterly_financials")
+                                              or {},
+                        "quarters": tool_raw.get("quarters") or [],
+                    }
+                else:
+                    quarterly_data = None
+                log_debug("QUARTERLY DATA (from tool)", quarterly_data or "None")
+            except Exception as e:
+                log_debug("QUARTERLY DATA (tool) ERROR", str(e))
+                quarterly_data = None
+
+        log_debug("QUARTERLY DATA (returned)", quarterly_data if quarterly_data is not None else "No data")
+
 
         return final_report, sources, quarterly_data
 

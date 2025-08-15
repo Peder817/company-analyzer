@@ -5,6 +5,10 @@ from main import run_company_analysis, DEBUG_LOG_FILE
 st.set_page_config(page_title="Company Analyzer", layout="wide")
 st.title("📊 Company Analyzer")
 
+if "analysis" not in st.session_state:
+    st.session_state["analysis"] = None
+
+
 def parse_sections(report: str) -> dict:
     """Plocka ut sektioner via våra markörer/rubriker."""
     import re
@@ -61,6 +65,20 @@ run = st.button("Generate report", type="primary")
 if run and company.strip():
     with st.spinner("Analyzing…"):
         report, sources, quarterly_data = run_company_analysis(company.strip())
+    # spara i sessionen så det överlever reruns
+    st.session_state["analysis"] = {
+        "company": company.strip(),
+        "report": report,
+        "sources": sources,
+        "quarterly_data": quarterly_data,
+    }
+
+data = st.session_state.get("analysis")
+if data:
+    company_saved = data["company"]
+    report = data["report"]
+    sources = data["sources"]
+    quarterly_data = data["quarterly_data"]
 
     sections = parse_sections(report)
 
@@ -84,11 +102,10 @@ if run and company.strip():
             st.subheader("Recommendations")
             st.markdown(sections["Recommendations"])
 
-        # Download full report as markdown
         st.download_button(
             "⬇️ Download report (.md)",
             data=report.encode("utf-8"),
-            file_name=f"{company.replace(' ', '_')}_report.md",
+            file_name=f"{company_saved.replace(' ', '_')}_report.md",
             mime="text/markdown"
         )
 
@@ -100,17 +117,58 @@ if run and company.strip():
         else:
             st.write("_No sources available._")
 
-        # Chart (if any)
+        # === Chart (metric selector + fallback) ===
+        st.subheader("Quarterly chart")
+
+        with st.expander("Chart debug", expanded=False):
+            st.write("Har explicit quarterly_data?", isinstance(quarterly_data, dict))
+            if isinstance(quarterly_data, dict):
+                # visa bara det vi bryr oss om
+                st.json({
+                    "quarterly_financials": quarterly_data.get("quarterly_financials") or quarterly_data.get("quarterly_financials_norm") or {},
+                    "quarters": quarterly_data.get("quarters", []),
+                })
+
         try:
-            from chart_utils import make_quarterly_chart
-            fig = make_quarterly_chart(quarterly_data)
-            if fig:
-                st.subheader("Quarterly Revenue")
-                st.pyplot(fig, use_container_width=True)
+            import chart_utils as cu
+
+            # Välj bästa källa: quarters-lista om finns, annars hela dicten
+            q_payload = None
+            if isinstance(quarterly_data, dict):
+                if quarterly_data.get("quarters"):
+                    q_payload = {"quarters": quarterly_data["quarters"]}
+                else:
+                    q_payload = quarterly_data
+
+            df = cu.quarterly_df(q_payload if q_payload is not None else report)
+
+            candidate_metrics = ["revenue", "net_income", "ebitda"]
+            available = [m for m in candidate_metrics if m in df.columns]
+
+            if not available:
+                st.info("Hittade inga metriker att plotta.")
             else:
-                st.info("No chartable quarterly data.")
+                c1, c2 = st.columns([1, 1.2])
+                with c1:
+                    metric = st.radio("Metric", available, index=0, horizontal=True, key="metric_selector")
+                with c2:
+                    smooth = st.toggle("7‑punkters glidande medelvärde", value=False, key="metric_smooth")
+
+                df_plot = df.sort_values("quarter").reset_index(drop=True).copy()
+                title = metric.replace("_"," ").title()
+                if smooth:
+                    smoothed_col = f"{metric}_smoothed"
+                    df_plot[smoothed_col] = df_plot[metric].rolling(window=7, min_periods=1).mean()
+                    df_plot = df_plot.rename(columns={smoothed_col: metric})
+                    title += " (smoothed)"
+
+                if hasattr(cu, "metric_chart"):
+                    st.altair_chart(cu.metric_chart(df_plot, metric=metric, title=title), use_container_width=True)
+                else:
+                    st.altair_chart(cu.revenue_chart(df_plot), use_container_width=True)
+
         except Exception as e:
-            st.caption(f"Chart unavailable: {e}")
+            st.warning(f"Kunde inte rita diagram: {e}")
 
         # Debug log
         with st.expander("Debug log (last ~5k chars)"):
@@ -119,3 +177,7 @@ if run and company.strip():
                 st.code(text[-5000:] if len(text) > 5000 else text)
             except Exception:
                 st.write("_No debug log available._")
+
+if st.button("Reset page"):
+    st.session_state["analysis"] = None
+    st.rerun()
